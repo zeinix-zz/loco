@@ -6,6 +6,7 @@ use sqlx::{Pool, Postgres};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use tree_fs::TreeBuilder;
 
 /// Seeds data into the database.
 ///
@@ -130,6 +131,7 @@ impl TestSupport for PostgresTest {
 pub struct SqliteTest {
     connection_string: String,
     db_folder: PathBuf,
+    _tree: tree_fs::Tree, // Keep the tree alive while the test runs
 }
 
 impl SqliteTest {
@@ -140,22 +142,22 @@ impl SqliteTest {
     pub fn new(conn_str: &str) -> Result<Self> {
         let db_name = db::extract_db_name(conn_str)?;
 
-        let temp_path = PathBuf::from("target").join("loco").join("test-dbs");
-
-        let test_folder_name = format!(
-            "{}_{}",
-            hash::random_string(10),
-            chrono::Utc::now().timestamp()
-        );
-        let db_folder = temp_path.join(test_folder_name);
-        std::fs::create_dir_all(&db_folder)
-            .map_err(|err| Error::string(&format!("could not create folder. err: {err}")))?;
-
-        let db_file_path = db_folder.join("test.sqlite");
+        let tree = TreeBuilder::default()
+            .add_empty_file("test.sqlite")
+            .create()
+            .map_err(|err| {
+                Error::string(&format!(
+                    "could not create test database directory. err: {err}"
+                ))
+            })?;
 
         Ok(Self {
-            connection_string: conn_str.replace(db_name, &db_file_path.display().to_string()),
-            db_folder,
+            connection_string: conn_str.replace(
+                db_name,
+                &tree.root.join("test.sqlite").display().to_string(),
+            ),
+            db_folder: tree.root.clone(),
+            _tree: tree,
         })
     }
 }
@@ -201,12 +203,9 @@ impl TestSupport for Any {
 mod tests {
 
     use super::*;
-    #[cfg(all(test, feature = "integration_test"))]
     use sqlx::Row;
-    #[cfg(all(test, feature = "integration_test"))]
     use std::{thread, time};
 
-    #[cfg(all(test, feature = "integration_test"))]
     async fn schema_exists(pool: &sqlx::PgPool, schema_name: &str) -> bool {
         let row =
             sqlx::query("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_database  WHERE datname = $1)")
@@ -231,11 +230,10 @@ mod tests {
         assert!(!sqlite.db_folder.exists());
     }
 
-    #[cfg(all(test, feature = "integration_test"))]
     #[tokio::test]
     async fn postgres_test_support() {
-        let conn = std::env::var("DATABASE_URL").expect("Postgres connection string");
-        let pg: PostgresTest = PostgresTest::new(&conn).expect("create Sqlite test support");
+        let (conn, _container) = crate::tests_cfg::postgres::setup_postgres_container().await;
+        let pg: PostgresTest = PostgresTest::new(&conn).expect("create Postgres test support");
 
         pg.init_db().await;
 

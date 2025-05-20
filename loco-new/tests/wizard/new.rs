@@ -1,3 +1,5 @@
+use std::{collections::HashMap, path::PathBuf, process::Output, sync::Arc};
+
 use duct::cmd;
 use loco::{
     generator::{executer::FileSystem, Generator},
@@ -5,7 +7,6 @@ use loco::{
     wizard::{self, AssetsOption, BackgroundOption, DBOption},
     OS,
 };
-use std::{collections::HashMap, path::PathBuf, process::Output, sync::Arc};
 
 // #[cfg(feature = "test-wizard")]
 // #[rstest::rstest]
@@ -18,8 +19,8 @@ use std::{collections::HashMap, path::PathBuf, process::Output, sync::Arc};
 //         BackgroundOption::None
 //     )]
 //     background: BackgroundOption,
-//     #[values(AssetsOption::Serverside, AssetsOption::Clientside, AssetsOption::None)]
-//     asset: AssetsOption,
+//     #[values(AssetsOption::Serverside, AssetsOption::Clientside,
+// AssetsOption::None)]     asset: AssetsOption,
 // ) {
 //     test_combination(db, background, asset, true);
 // }
@@ -128,13 +129,16 @@ fn test_combination(
         }
 
         // Generate deployment nginx
-        tester.run_generate(&vec!["deployment", "--kind", "nginx"]);
+        tester.run_generate(&vec!["deployment", "nginx"]);
 
         // Generate deployment nginx
-        tester.run_generate(&vec!["deployment", "--kind", "docker"]);
+        tester.run_generate(&vec!["deployment", "docker"]);
 
         // Generate deployment shuttle
-        tester.run_generate(&vec!["deployment", "--kind", "shuttle"]);
+        tester.run_generate(&vec!["deployment", "shuttle"]);
+
+        // Generate data
+        tester.run_generate(&vec!["data", "stocks"]);
 
         if db.enable() {
             // Generate Model
@@ -212,7 +216,7 @@ impl Tester {
         cmd!(
             "cargo",
             "clippy",
-            "--quiet",
+            // "--quiet",
             "--",
             "-W",
             "clippy::pedantic",

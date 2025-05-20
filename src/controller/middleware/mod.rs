@@ -6,8 +6,6 @@
 //! handling. The middleware can be easily configured and applied to the
 //! application's router.
 
-#[cfg(all(feature = "auth_jwt", feature = "with-db"))]
-pub mod auth;
 pub mod catch_panic;
 pub mod compression;
 pub mod cors;
@@ -20,6 +18,12 @@ pub mod powered_by;
 pub mod remote_ip;
 pub mod request_id;
 pub mod secure_headers;
+#[cfg(feature = "embedded_assets")]
+pub mod static_assets_embedded;
+#[cfg(feature = "embedded_assets")]
+pub use static_assets_embedded as static_assets;
+
+#[cfg(not(feature = "embedded_assets"))]
 pub mod static_assets;
 pub mod timeout;
 

@@ -14,15 +14,13 @@
 //!     cli::main::<App, Migrator>().await
 //! }
 //! ```
-cfg_if::cfg_if! {
-    if #[cfg(feature = "with-db")] {
-        use sea_orm_migration::MigratorTrait;
-        use crate::doctor;
-        use crate::boot::{run_db};
-        use crate::db;
-    } else {}
-}
+#[cfg(feature = "with-db")]
+use {crate::boot::run_db, crate::db, crate::doctor, sea_orm_migration::MigratorTrait};
 
+use clap::{ArgAction, ArgGroup, Parser, Subcommand, ValueHint};
+use colored::Colorize;
+use duct::cmd;
+use std::fmt::Write;
 #[cfg(any(
     feature = "bg_redis",
     feature = "bg_pg",
@@ -32,12 +30,10 @@ cfg_if::cfg_if! {
 use std::process::exit;
 use std::{collections::BTreeMap, path::PathBuf};
 
-use clap::{ArgAction, Parser, Subcommand, ValueHint};
-use colored::Colorize;
-use duct::cmd;
-
 #[cfg(any(feature = "bg_redis", feature = "bg_pg", feature = "bg_sqlt"))]
 use crate::bgworker::JobStatus;
+#[cfg(debug_assertions)]
+use crate::controller;
 use crate::{
     app::{AppContext, Hooks},
     boot::{
@@ -45,10 +41,10 @@ use crate::{
         start, RunDbCommand, ServeParams, StartMode,
     },
     config::Config,
-    controller,
     environment::{resolve_from_env, Environment, DEFAULT_ENVIRONMENT},
     logger, task, Error,
 };
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
@@ -73,11 +69,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start an app
+    #[command(group(ArgGroup::new("start_mode").args(&["worker", "server_and_worker", "all"])))]
     #[clap(alias("s"))]
     Start {
-        /// start worker
-        #[arg(short, long, action, conflicts_with_all = &["server_and_worker", "all"])]
-        worker: bool,
+        /// Start worker. Optionally provide tags to run specific jobs (e.g. --worker=tag1,tag2)
+        #[arg(short, long, action, value_delimiter = ',', num_args = 0.., conflicts_with_all = &["server_and_worker", "all"])]
+        worker: Option<Vec<String>>,
         /// Start the server and worker in the same process
         #[arg(short, long, action, conflicts_with_all = &["worker", "all"])]
         server_and_worker: bool,
@@ -165,8 +162,8 @@ enum Commands {
     #[clap(alias("w"))]
     Watch {
         /// start worker
-        #[arg(short, long, action)]
-        worker: bool,
+        #[arg(short, long, action, value_delimiter = ',', num_args = 0..)]
+        worker: Option<Vec<String>>,
         /// start same-process server and worker
         #[arg(short, long, action)]
         server_and_worker: bool,
@@ -325,10 +322,15 @@ After running the migration, follow these steps to complete the process:
         /// Name of the thing to generate
         name: String,
     },
+    /// Generate data loader
+    Data {
+        /// Name of the thing to generate
+        name: String,
+    },
     /// Generate a deployment infrastructure
     Deployment {
         // deployment kind.
-        #[clap(long, value_enum)]
+        #[clap(value_enum)]
         kind: DeploymentKind,
     },
 
@@ -424,6 +426,7 @@ impl ComponentArg {
             Self::Scheduler {} => Ok(loco_gen::Component::Scheduler {}),
             Self::Worker { name } => Ok(loco_gen::Component::Worker { name }),
             Self::Mailer { name } => Ok(loco_gen::Component::Mailer { name }),
+            Self::Data { name } => Ok(loco_gen::Component::Data { name }),
             Self::Deployment { kind } => Ok(kind.to_generator_component(config)),
             Self::Override {
                 template_path: _,
@@ -514,6 +517,7 @@ pub enum DeploymentKind {
 }
 
 impl DeploymentKind {
+    #[cfg(debug_assertions)]
     fn to_generator_component(&self, config: &Config) -> loco_gen::Component {
         let kind = match self {
             Self::Docker => {
@@ -631,12 +635,12 @@ pub async fn playground<H: Hooks>() -> crate::Result<AppContext> {
     let environment: Environment = cli.environment.unwrap_or_else(resolve_from_env).into();
 
     let config = H::load_config(&environment).await?;
+    let app_context = create_context::<H>(&environment, config).await?;
 
-    if !H::init_logger(&config, &environment)? {
-        logger::init::<H>(&config.logger)?;
+    if !H::init_logger(&app_context)? {
+        logger::init::<H>(&app_context.config.logger)?;
     }
 
-    let app_context = create_context::<H>(&environment, config).await?;
     Ok(app_context)
 }
 
@@ -672,9 +676,10 @@ pub async fn main<H: Hooks, M: MigratorTrait>() -> crate::Result<()> {
     let environment: Environment = cli.environment.unwrap_or_else(resolve_from_env).into();
 
     let config = H::load_config(&environment).await?;
+    let app_context = create_context::<H>(&environment, config).await?;
 
-    if !H::init_logger(&config, &environment)? {
-        logger::init::<H>(&config.logger)?;
+    if !H::init_logger(&app_context)? {
+        logger::init::<H>(&app_context.config.logger)?;
     }
 
     let task_span = create_root_span(&environment);
@@ -689,17 +694,19 @@ pub async fn main<H: Hooks, M: MigratorTrait>() -> crate::Result<()> {
             port,
             no_banner,
         } => {
-            let start_mode = if worker {
-                StartMode::WorkerOnly
-            } else if server_and_worker {
-                StartMode::ServerAndWorker
-            } else if all {
-                StartMode::All
-            } else {
-                StartMode::ServerOnly
-            };
+            let start_mode = worker.map_or(
+                if server_and_worker {
+                    StartMode::ServerAndWorker
+                } else if all {
+                    StartMode::All
+                } else {
+                    StartMode::ServerOnly
+                },
+                |tags| StartMode::WorkerOnly { tags },
+            );
 
-            let boot_result = create_app::<H, M>(start_mode, &environment, config).await?;
+            let boot_result =
+                create_app::<H, M>(start_mode, &environment, app_context.config).await?;
             let serve_params = ServeParams {
                 port: port.map_or(boot_result.app_context.config.server.port, |p| p),
                 binding: binding
@@ -710,22 +717,21 @@ pub async fn main<H: Hooks, M: MigratorTrait>() -> crate::Result<()> {
         #[cfg(feature = "with-db")]
         Commands::Db { command } => {
             if matches!(command, DbCommands::Create) {
-                db::create(&config.database.uri).await?;
+                db::create(&app_context.config.database.uri).await?;
             } else {
-                let app_context = create_context::<H>(&environment, config).await?;
                 run_db::<H, M>(&app_context, command.into()).await?;
             }
         }
         #[cfg(any(feature = "bg_redis", feature = "bg_pg", feature = "bg_sqlt"))]
         Commands::Jobs { command } => {
-            handle_job_command::<H>(command, &environment, config).await?;
+            handle_job_command::<H>(command, &environment, app_context.config).await?;
         }
         Commands::Routes {} => {
-            let app_context = create_context::<H>(&environment, config).await?;
+            let app_context = create_context::<H>(&environment, app_context.config).await?;
             show_list_endpoints::<H>(&app_context);
         }
         Commands::Middleware { show_config } => {
-            let app_context = create_context::<H>(&environment, config).await?;
+            let app_context = create_context::<H>(&environment, app_context.config).await?;
             let middlewares = list_middlewares::<H>(&app_context);
             for middleware in middlewares.iter().filter(|m| m.enabled) {
                 println!(
@@ -745,7 +751,7 @@ pub async fn main<H: Hooks, M: MigratorTrait>() -> crate::Result<()> {
         }
         Commands::Task { name, params } => {
             let vars = task::Vars::from_cli_args(params);
-            let app_context = create_context::<H>(&environment, config).await?;
+            let app_context = create_context::<H>(&environment, app_context.config).await?;
             run_task::<H>(&app_context, name.as_ref(), &vars).await?;
         }
         Commands::Scheduler {
@@ -754,23 +760,23 @@ pub async fn main<H: Hooks, M: MigratorTrait>() -> crate::Result<()> {
             tag,
             list,
         } => {
-            let app_context = create_context::<H>(&environment, config).await?;
+            let app_context = create_context::<H>(&environment, app_context.config).await?;
             run_scheduler::<H>(&app_context, config_path.as_ref(), name, tag, list).await?;
         }
         #[cfg(debug_assertions)]
         Commands::Generate { component } => {
-            handle_generate_command::<H>(component, &config)?;
+            handle_generate_command::<H>(component, &app_context.config)?;
         }
         Commands::Doctor {
             config: config_arg,
             production,
         } => {
             if config_arg {
-                println!("{}", &config);
+                println!("{}", &app_context.config);
                 println!("Environment: {}", &environment);
             } else {
                 let mut should_exit = false;
-                for (_, check) in doctor::run_all(&config, production).await? {
+                for (_, check) in doctor::run_all(&app_context.config, production).await? {
                     if !should_exit && !check.valid() {
                         should_exit = true;
                     }
@@ -790,21 +796,25 @@ pub async fn main<H: Hooks, M: MigratorTrait>() -> crate::Result<()> {
             server_and_worker,
         } => {
             // cargo-watch  -s 'cargo loco start'
-            let mut subcmd = vec!["cargo", "loco", "start"];
-            if worker {
-                subcmd.push("--worker");
+            let mut cmd_str = String::from("cargo loco start");
+
+            if let Some(worker_tags) = worker {
+                if worker_tags.is_empty() {
+                    cmd_str.push_str(" --worker");
+                } else {
+                    write!(cmd_str, " --worker={}", worker_tags.join(","))
+                        .expect("Failed to write to string");
+                }
             } else if server_and_worker {
-                subcmd.push("--server-and-worker");
+                cmd_str.push_str(" --server-and-worker");
             }
 
-            cmd("cargo-watch", &["-s", &subcmd.join(" ")])
-                .run()
-                .map_err(|err| {
-                    Error::Message(format!(
-                        "failed to start with `cargo-watch`. Did you `cargo install \
+            cmd("cargo-watch", &["-s", &cmd_str]).run().map_err(|err| {
+                Error::Message(format!(
+                    "failed to start with `cargo-watch`. Did you `cargo install \
                          cargo-watch`?. error details: `{err}`",
-                    ))
-                })?;
+                ))
+            })?;
         }
     }
     Ok(())
@@ -816,9 +826,10 @@ pub async fn main<H: Hooks>() -> crate::Result<()> {
     let environment: Environment = cli.environment.unwrap_or_else(resolve_from_env).into();
 
     let config = H::load_config(&environment).await?;
+    let app_context = create_context::<H>(&environment, config).await?;
 
-    if !H::init_logger(&config, &environment)? {
-        logger::init::<H>(&config.logger)?;
+    if !H::init_logger(&app_context)? {
+        logger::init::<H>(&app_context.config.logger)?;
     }
 
     let task_span = create_root_span(&environment);
@@ -833,17 +844,18 @@ pub async fn main<H: Hooks>() -> crate::Result<()> {
             port,
             no_banner,
         } => {
-            let start_mode = if worker {
-                StartMode::WorkerOnly
-            } else if server_and_worker {
-                StartMode::ServerAndWorker
-            } else if all {
-                StartMode::All
-            } else {
-                StartMode::ServerOnly
-            };
+            let start_mode = worker.map_or(
+                if server_and_worker {
+                    StartMode::ServerAndWorker
+                } else if all {
+                    StartMode::All
+                } else {
+                    StartMode::ServerOnly
+                },
+                |tags| StartMode::WorkerOnly { tags },
+            );
 
-            let boot_result = create_app::<H>(start_mode, &environment, config).await?;
+            let boot_result = create_app::<H>(start_mode, &environment, app_context.config).await?;
             let serve_params = ServeParams {
                 port: port.map_or(boot_result.app_context.config.server.port, |p| p),
                 binding: binding.map_or(
@@ -853,12 +865,8 @@ pub async fn main<H: Hooks>() -> crate::Result<()> {
             };
             start::<H>(boot_result, serve_params, no_banner).await?;
         }
-        Commands::Routes {} => {
-            let app_context = create_context::<H>(&environment, config).await?;
-            show_list_endpoints::<H>(&app_context)
-        }
+        Commands::Routes {} => show_list_endpoints::<H>(&app_context),
         Commands::Middleware { show_config } => {
-            let app_context = create_context::<H>(&environment, config).await?;
             let middlewares = list_middlewares::<H>(&app_context);
             for middleware in middlewares.iter().filter(|m| m.enabled) {
                 println!(
@@ -878,7 +886,6 @@ pub async fn main<H: Hooks>() -> crate::Result<()> {
         }
         Commands::Task { name, params } => {
             let vars = task::Vars::from_cli_args(params);
-            let app_context = create_context::<H>(&environment, config).await?;
             run_task::<H>(&app_context, name.as_ref(), &vars).await?;
         }
         #[cfg(any(feature = "bg_redis", feature = "bg_pg", feature = "bg_sqlt"))]
@@ -891,12 +898,11 @@ pub async fn main<H: Hooks>() -> crate::Result<()> {
             tag,
             list,
         } => {
-            let app_context = create_context::<H>(&environment, config).await?;
             run_scheduler::<H>(&app_context, config_path.as_ref(), name, tag, list).await?;
         }
         #[cfg(debug_assertions)]
         Commands::Generate { component } => {
-            handle_generate_command::<H>(component, &config)?;
+            handle_generate_command::<H>(component, &app_context.config)?;
         }
         Commands::Version {} => {
             println!("{}", H::app_version(),);
@@ -906,30 +912,182 @@ pub async fn main<H: Hooks>() -> crate::Result<()> {
             server_and_worker,
         } => {
             // cargo-watch  -s 'cargo loco start'
-            let mut subcmd = vec!["cargo", "loco", "start"];
-            if worker {
-                subcmd.push("--worker");
+            let mut cmd_str = String::from("cargo loco start");
+
+            if let Some(worker_tags) = worker {
+                if worker_tags.is_empty() {
+                    cmd_str.push_str(" --worker");
+                } else {
+                    write!(cmd_str, " --worker={}", worker_tags.join(","))
+                        .expect("Failed to write to string");
+                }
             } else if server_and_worker {
-                subcmd.push("--server-and-worker");
+                cmd_str.push_str(" --server-and-worker");
             }
 
-            cmd("cargo-watch", &["-s", &subcmd.join(" ")])
-                .run()
-                .map_err(|err| {
-                    Error::Message(format!(
-                        "failed to start with `cargo-watch`. Did you `cargo install \
+            cmd("cargo-watch", &["-s", &cmd_str]).run().map_err(|err| {
+                Error::Message(format!(
+                    "failed to start with `cargo-watch`. Did you `cargo install \
                          cargo-watch`?. error details: `{err}`",
-                    ))
-                })?;
+                ))
+            })?;
         }
     }
     Ok(())
 }
 
-fn show_list_endpoints<H: Hooks>(ctx: &AppContext) {
-    let mut routes = list_endpoints::<H>(ctx);
+// Define route node structure with enhanced methods
+#[derive(Default)]
+struct RouteNode {
+    children: BTreeMap<String, RouteNode>,
+    endpoints: Vec<(String, String)>,
+}
 
-    // Sort first by path, then ensure HTTP methods are in a consistent order
+impl RouteNode {
+    fn is_leaf(&self) -> bool {
+        self.endpoints.len() == 1 && self.children.is_empty()
+    }
+
+    fn is_collapsible(&self) -> bool {
+        self.endpoints.is_empty()
+            && self.children.len() == 1
+            && self.children.values().next().is_some_and(Self::is_leaf)
+    }
+
+    fn method(&self) -> &str {
+        self.endpoints
+            .first()
+            .map_or("", |(method, _)| method.as_str())
+    }
+
+    fn print(&self, prefix: &str, segment: &str, is_last: bool, is_root: bool, current_path: &str) {
+        match (is_root, self.is_leaf(), self.is_collapsible()) {
+            // Root level special cases
+            (true, true, _) => {
+                Self::print_with_format(
+                    &format!("/{segment}"),
+                    &color_method(self.method()),
+                    &Self::build_path(&[current_path, segment]),
+                );
+            }
+            (true, _, true) => {
+                let Some((child_segment, child_node)) = self.children.iter().next() else {
+                    return;
+                };
+                Self::print_with_format(
+                    &format!("/{segment}/{child_segment}"),
+                    &color_method(child_node.method()),
+                    &Self::build_path(&[current_path, segment, child_segment]),
+                );
+            }
+
+            // Non root level special cases
+            (false, true, _) => {
+                let prefix_str = Self::format_prefix(prefix, is_last, true);
+
+                Self::print_with_format(
+                    &format!("{prefix_str}{segment}"),
+                    &color_method(self.method()),
+                    &Self::build_path(&[current_path, segment]),
+                );
+            }
+            (false, _, true) => {
+                let prefix_str = Self::format_prefix(prefix, is_last, true);
+                let Some((child_segment, child_node)) = self.children.iter().next() else {
+                    return;
+                };
+                Self::print_with_format(
+                    &format!("{prefix_str}{segment}/{child_segment}"),
+                    &color_method(child_node.method()),
+                    &Self::build_path(&[current_path, segment, child_segment]),
+                );
+            }
+
+            // Standard branch node handling
+            _ => {
+                if is_root {
+                    println!("/{segment}");
+                } else if !segment.is_empty() {
+                    println!("{}{}", Self::format_prefix(prefix, is_last, true), segment);
+                }
+
+                // Print endpoints and children
+                let next_prefix = Self::format_next_prefix(prefix, is_last);
+                self.print_endpoints(
+                    &next_prefix,
+                    self.children.is_empty(),
+                    &Self::build_path(&[current_path, segment]),
+                );
+                self.print_children(&next_prefix, &Self::build_path(&[current_path, segment]));
+            }
+        }
+    }
+
+    fn print_endpoints(&self, prefix: &str, is_last_group: bool, current_path: &str) {
+        for (i, (method, _)) in self.endpoints.iter().enumerate() {
+            let is_last_entry = i == self.endpoints.len() - 1 && is_last_group;
+            let marker = if is_last_entry { "└─" } else { "├─" };
+            Self::print_with_format(
+                &format!("{prefix}{marker}"),
+                &color_method(method),
+                current_path,
+            );
+        }
+    }
+
+    fn print_children(&self, prefix: &str, current_path: &str) {
+        let children = self.children.iter().collect::<Vec<_>>();
+        for (i, (child_segment, child_node)) in children.iter().enumerate() {
+            let is_last_child = i == children.len() - 1;
+
+            if child_node.is_leaf() {
+                let marker = if is_last_child { "└─" } else { "├─" };
+                Self::print_with_format(
+                    &format!("{prefix}{marker} /{child_segment}"),
+                    &color_method(child_node.method()),
+                    &Self::build_path(&[current_path, child_segment]),
+                );
+            } else {
+                child_node.print(prefix, child_segment, is_last_child, false, current_path);
+            }
+        }
+    }
+
+    fn format_prefix(prefix: &str, is_last: bool, with_slash: bool) -> String {
+        let marker = if is_last { "└─" } else { "├─" };
+        if with_slash {
+            format!("{prefix}{marker} /")
+        } else {
+            format!("{prefix}{marker} ")
+        }
+    }
+
+    fn format_next_prefix(prefix: &str, is_last: bool) -> String {
+        if is_last {
+            format!("{prefix}   ")
+        } else {
+            format!("{prefix}│  ")
+        }
+    }
+
+    fn build_path(segments: &[&str]) -> String {
+        segments.iter().fold(String::new(), |mut acc, &segment| {
+            if !segment.is_empty() {
+                acc.push('/');
+                acc.push_str(segment);
+            }
+            acc.replace("//", "/")
+        })
+    }
+
+    fn print_with_format(tree: &str, method: &str, full_path: &str) {
+        println!("{:<50} {}", format!("{tree} {method}"), full_path);
+    }
+}
+
+fn show_list_endpoints<H: Hooks>(ctx: &AppContext) {
+    // Get and sort routes
+    let mut routes = list_endpoints::<H>(ctx);
     routes.sort_by(|a, b| {
         let method_priority = |actions: &[_]| match actions
             .first()
@@ -944,75 +1102,44 @@ fn show_list_endpoints<H: Hooks>(ctx: &AppContext) {
             "DELETE" => 4,
             _ => 5,
         };
-
-        let a_priority = method_priority(&a.actions);
-        let b_priority = method_priority(&b.actions);
-
-        a.uri.cmp(&b.uri).then(a_priority.cmp(&b_priority))
+        a.uri
+            .cmp(&b.uri)
+            .then(method_priority(&a.actions).cmp(&method_priority(&b.actions)))
     });
 
-    // Group routes by their first path segment and full path
-    let mut path_groups: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
-
+    // Build route tree
+    let mut route_tree = RouteNode::default();
     for router in routes {
         let path = router.uri.trim_start_matches('/');
         let segments: Vec<&str> = path.split('/').collect();
-        let root = (*segments.first().unwrap_or(&"")).to_string();
+        if segments.is_empty() {
+            continue;
+        }
 
-        let actions_str = router
-            .actions
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
+        // Insert the route into the tree
+        let mut current_node = &mut route_tree;
+        for segment in &segments {
+            current_node = current_node
+                .children
+                .entry((*segment).to_string())
+                .or_default();
+        }
 
-        path_groups
-            .entry(root)
-            .or_default()
-            .entry(router.uri.to_string())
-            .or_default()
-            .push(actions_str);
+        // Store the endpoint at this node
+        current_node.endpoints.push((
+            router
+                .actions
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            router.uri.clone(),
+        ));
     }
 
-    // Print tree structure
-    for (root, paths) in path_groups {
-        println!("/{}", root.bold());
-        let paths_count = paths.len();
-        let mut path_idx = 0;
-
-        for (path, methods) in paths {
-            path_idx += 1;
-            let is_last_path = path_idx == paths_count;
-            let is_group = methods.len() > 1;
-
-            // Print first method
-            let prefix = if is_last_path && !is_group {
-                "  └─ "
-            } else {
-                "  ├─ "
-            };
-            let colored_method = color_method(&methods[0]);
-            println!("{prefix}{colored_method}\t{path}");
-
-            // Print additional methods in group
-            if is_group {
-                for (i, method) in methods[1..].iter().enumerate() {
-                    let is_last_in_group = i == methods.len() - 2;
-                    let group_prefix = if is_last_path && is_last_in_group {
-                        "  └─ "
-                    } else {
-                        "  │  "
-                    };
-                    let colored_method = color_method(method);
-                    println!("{group_prefix}{colored_method}\t{path}");
-                }
-
-                // Add spacing between groups if not the last path
-                if !is_last_path {
-                    println!("  │");
-                }
-            }
-        }
+    // Print the route tree
+    for (i, (segment, node)) in route_tree.children.iter().enumerate() {
+        node.print("", segment, i == route_tree.children.len() - 1, true, "");
     }
 }
 
@@ -1144,7 +1271,7 @@ fn handle_generate_command<H: Hooks>(
         )?;
         let messages = loco_gen::collect_messages(&get_result);
         println!("{messages}");
-    };
+    }
     Ok(())
 }
 
@@ -1170,54 +1297,60 @@ pub fn format_templates_as_tree(paths: Vec<PathBuf>) -> String {
         }
     }
 
-    let mut output = String::new();
-    output.push_str("Available templates and directories to copy:\n\n");
+    let mut output = "Available templates and directories to copy:".to_string();
+    let _ = writeln!(output);
+    let _ = writeln!(output);
 
     for (top_level, sub_categories) in &categories {
-        output.push_str(&format!("{}", format!("{top_level}\n").yellow()));
+        let _ = writeln!(output, "{}", top_level.to_string().yellow());
 
         for (sub_category, paths) in sub_categories {
             if !sub_category.is_empty() {
-                output.push_str(&format!("{}", format!(" └── {sub_category}\n").yellow()));
+                let _ = writeln!(output, "{}", format!(" └── {sub_category}").yellow());
             }
 
             for path in paths {
-                output.push_str(&format!(
-                    "   └── {}\n",
+                let _ = writeln!(
+                    output,
+                    "   └── {}",
                     path.file_name().unwrap_or_default().to_string_lossy()
-                ));
+                );
             }
         }
     }
 
-    output.push_str(&format!("\n\n{}\n\n", "Usage Examples:".bold().green()));
-    output.push_str(&format!("{}", "Override a Specific File:\n".bold()));
-    output.push_str(&format!(
-        " * cargo loco generate override {}\n",
+    let _ = writeln!(output);
+    let _ = writeln!(output);
+    let _ = writeln!(output, "{}", "Usage Examples:".bold().green());
+    let _ = writeln!(output);
+    let _ = writeln!(output, "{}", "Override a Specific File:".bold());
+
+    let _ = writeln!(
+        output,
+        " * cargo loco generate override {}",
         "scaffold/api/controller.t".yellow()
-    ));
-    output.push_str(&format!(
+    );
+    let _ = writeln!(
+        output,
         " * cargo loco generate override {}",
         "migration/add_columns.t".yellow()
-    ));
-    output.push_str(&format!(
-        "{}",
-        "\n\nOverride All Files in a Folder:\n".bold()
-    ));
-    output.push_str(&format!(
-        " * cargo loco generate override {}\n",
+    );
+    let _ = writeln!(output);
+    let _ = writeln!(output, "{}", "Override All Files in a Folder:".bold());
+    let _ = writeln!(
+        output,
+        " * cargo loco generate override {}",
         "scaffold/htmx".yellow()
-    ));
-    output.push_str(&format!(
+    );
+
+    let _ = writeln!(
+        output,
         " * cargo loco generate override {}",
         "task".yellow()
-    ));
-    // output.push_str(" * cargo loco generate override task");
-    output.push_str(&format!("{}", "\n\nOverride All templates:\n".bold()));
-    output.push_str(&format!(
-        " * cargo loco generate override {}\n",
-        ".".yellow()
-    ));
+    );
+    let _ = writeln!(output);
+    let _ = writeln!(output, "{}", "Override All templates:".bold());
+    let _ = writeln!(output, " * cargo loco generate override {}", ".".yellow());
 
     output
 }

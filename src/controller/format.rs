@@ -140,6 +140,29 @@ pub fn html(content: &str) -> Result<Response> {
     Ok(Html(content.to_string()).into_response())
 }
 
+/// Returns a YAML response
+///
+/// # Example:
+///
+/// ```rust
+/// use loco_rs::prelude::*;
+///
+/// pub async fn openapi_spec_yaml() -> Result<Response> {
+///     format::yaml("openapi: 3.1.0\ninfo:\n  title: Loco Demo\n  ")
+/// }
+/// ```
+///
+/// # Errors
+///
+/// Currently this function doesn't return any error. this is for feature
+/// functionality
+pub fn yaml(content: &str) -> Result<Response> {
+    Ok(Builder::new()
+        .header(header::CONTENT_TYPE, "application/yaml")
+        .body(Body::from(content.to_string()))?
+        .into_response())
+}
+
 /// Returns an redirect response
 ///
 /// # Example:
@@ -454,6 +477,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn yaml_response_format() {
+        let response_content: &str = "openapi: 3.1.0\ninfo:\n  title: Loco Demo\n  ";
+        let response = yaml(response_content).unwrap();
+
+        assert_debug_snapshot!(response);
+        assert_eq!(response_body_to_string(response).await, response_content);
+    }
+
+    #[tokio::test]
     async fn redirect_response() {
         let response = redirect("https://loco.rs").unwrap();
 
@@ -461,18 +493,15 @@ mod tests {
         assert_eq!(response_body_to_string(response).await, String::new());
     }
 
+    #[cfg(not(feature = "embedded_assets"))]
     #[tokio::test]
     async fn view_response() {
-        let yaml_content = r"
-        drop: true
-        files:
-        - path: template/test.html
-          content: |-
-            - {{foo}}
-        ";
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .add_file("template/test.html", "- {{foo}}")
+            .create()
+            .unwrap();
 
-        let tree_res = tree_fs::from_yaml_str(yaml_content).unwrap();
-        let v = TeraView::from_custom_dir(&tree_res.root).unwrap();
+        let v = TeraView::from_custom_dir(&tree_fs.root).unwrap();
 
         assert_debug_snapshot!(view(&v, "template/none.html", serde_json::json!({})));
         let response = view(&v, "template/test.html", serde_json::json!({"foo": "loco"})).unwrap();
@@ -557,18 +586,15 @@ mod tests {
         assert_eq!(response_body_to_string(response).await, String::new());
     }
 
+    #[cfg(not(feature = "embedded_assets"))]
     #[tokio::test]
     async fn builder_view_response() {
-        let yaml_content = r"
-        drop: true
-        files:
-        - path: template/test.html
-          content: |-
-            - {{foo}}
-        ";
+        let tree_fs = tree_fs::TreeBuilder::default()
+            .add_file("template/test.html", "- {{foo}}")
+            .create()
+            .unwrap();
 
-        let tree_res = tree_fs::from_yaml_str(yaml_content).unwrap();
-        let v = TeraView::from_custom_dir(&tree_res.root).unwrap();
+        let v = TeraView::from_custom_dir(&tree_fs.root).unwrap();
 
         assert_debug_snapshot!(view(&v, "template/none.html", serde_json::json!({})));
         let response = render()

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 mod controller;
 use colored::Colorize;
+use std::fmt::Write;
 use std::{
     collections::HashMap,
     fs,
@@ -291,6 +292,10 @@ pub enum Component {
         /// Name of the thing to generate
         name: String,
     },
+    Data {
+        /// Name of the thing to generate
+        name: String,
+    },
     Deployment {
         kind: DeploymentKind,
     },
@@ -383,6 +388,10 @@ pub fn generate(rrgen: &RRgen, component: Component, appinfo: &AppInfo) -> Resul
                 render_template(rrgen, Path::new("deployment/nginx"), &vars)?
             }
         },
+        Component::Data { name } => {
+            let vars = json!({ "name": name });
+            render_template(rrgen, Path::new("data"), &vars)?
+        }
     };
 
     Ok(get_result)
@@ -409,7 +418,7 @@ fn render_template(rrgen: &RRgen, template: &Path, vars: &Value) -> Result<Gener
                 template.path().display()
             )))?;
             gen_result.push(rrgen.generate(content, vars)?);
-        };
+        }
     }
 
     Ok(GenerateResults {
@@ -427,17 +436,20 @@ pub fn collect_messages(results: &GenerateResults) -> String {
             message: Some(message),
         } = res
         {
-            messages.push_str(&format!("* {message}\n"));
+            let _ = writeln!(messages, "* {message}");
         }
     }
 
     if !results.local_templates.is_empty() {
-        messages.push_str(&format!(
+        let _ = writeln!(messages);
+        let _ = writeln!(
+            messages,
             "{}",
-            "\nThe following templates were sourced from the local templates:\n".green()
-        ));
+            "The following templates were sourced from the local templates:".green()
+        );
+
         for f in &results.local_templates {
-            messages.push_str(&format!("* {}\n", f.display()));
+            let _ = writeln!(messages, "* {}", f.display());
         }
     }
     messages
@@ -503,8 +515,9 @@ pub fn copy_template(path: &Path, to: &Path) -> Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::Path;
+
+    use super::*;
 
     #[test]
     fn test_template_not_found() {
@@ -688,5 +701,38 @@ mod tests {
             .is_err());
 
         assert!(mapping.rust_field_with_params("unknown", &vec![]).is_err());
+    }
+
+    #[test]
+    fn can_collect_messages() {
+        let gen_result = GenerateResults {
+            rrgen: vec![
+                GenResult::Skipped,
+                GenResult::Generated {
+                    message: Some("test".to_string()),
+                },
+                GenResult::Generated {
+                    message: Some("test2".to_string()),
+                },
+                GenResult::Generated { message: None },
+            ],
+            local_templates: vec![
+                PathBuf::from("template").join("scheduler.t"),
+                PathBuf::from("template").join("task.t"),
+            ],
+        };
+
+        let re = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
+
+        assert_eq!(
+            re.replace_all(&collect_messages(&gen_result), ""),
+            r"* test
+* test2
+
+The following templates were sourced from the local templates:
+* template/scheduler.t
+* template/task.t
+"
+        );
     }
 }

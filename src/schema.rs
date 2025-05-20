@@ -43,7 +43,10 @@ pub fn timestamptz_null<T>(name: T) -> ColumnDef
 where
     T: IntoIden,
 {
-    ColumnDef::new(name).timestamp_with_time_zone().take()
+    ColumnDef::new(name)
+        .timestamp_with_time_zone()
+        .null()
+        .take()
 }
 
 /// Create a non-nullable timestamptz column definition.
@@ -177,8 +180,9 @@ pub enum ColType {
 
 pub enum ArrayColType {
     String,
-    Float,
     Int,
+    BigInt,
+    Float,
     Double,
     Bool,
 }
@@ -205,8 +209,9 @@ impl ColType {
     fn array_col_type(kind: &ArrayColType) -> ColumnType {
         match kind {
             ArrayColType::String => ColumnType::string(None),
-            ArrayColType::Float => ColumnType::Float,
             ArrayColType::Int => ColumnType::Integer,
+            ArrayColType::BigInt => ColumnType::BigInteger,
+            ArrayColType::Float => ColumnType::Float,
             ArrayColType::Double => ColumnType::Double,
             ArrayColType::Bool => ColumnType::Boolean,
         }
@@ -422,8 +427,6 @@ async fn create_table_impl(
             idx.col(Alias::new(nz_ref_name));
         }
         stmt.primary_key(&mut idx);
-    } else {
-        stmt.col(pk_auto(Alias::new("id")));
     }
 
     for (name, atype) in cols {

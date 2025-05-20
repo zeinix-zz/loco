@@ -15,7 +15,15 @@ flair =[]
 
 Deployment is super simple in Loco, and this is why this guide is super short. Although **most of the time in development you are using `cargo`** when deploying, you use the **binary that was compiled**, there is no need for `cargo` or Rust on the target server.
 
-To deploy, build your production binary for your relevant server architecture:
+## How to Deploy
+First, check your Cargo.toml to see your application name:
+```toml
+[package]
+name = "myapp" # This is your binary name
+version = "0.1.0"
+```
+
+build your production binary for your relevant server architecture:
 
 <!-- <snip id="build-command" inject_from="yaml" template="sh"> -->
 ```sh
@@ -24,6 +32,11 @@ cargo build --release
 <!-- </snip>-->
 
 And copy your binary along with your `config/` folder to the server. You can then run `myapp start` on your server.
+
+```sh
+# The binary is located in ./target/release/ after building
+./target/release/myapp start
+```
 
 That's it!
 
@@ -149,21 +162,28 @@ $ myapp doctor --production
 
 Loco offers a deployment template enabling the creation of a deployment infrastructure.
 
-<!-- <snip id="generate-deployment-command" inject_from="yaml" template="sh"> -->
 ```sh
-cargo loco generate deployment
-? ❯ Choose your deployment ›
-❯ Docker
-❯ Shuttle
-❯ Nginx
+$ cargo loco generate deployment --help
+Generate a deployment infrastructure
 
-..
-✔ ❯ Choose your deployment · Docker
-skipped (exists): "dockerfile"
-added: ".dockerignore"
+Usage: myapp-cli generate deployment [OPTIONS] <KIND>
+
+Arguments:
+  <KIND>  [possible values: docker, shuttle, nginx]
 ```
-<!-- </snip>-->
 
+<!-- <snip id="generate-deployment-command" inject_from="yaml" template="sh"> -->
+
+```sh
+cargo loco generate deployment docker
+
+added: "dockerfile"
+added: ".dockerignore"
+* Dockerfile generated successfully.
+* Dockerignore generated successfully
+```
+
+<!-- </snip>-->
 
 Deployment Options:
 
